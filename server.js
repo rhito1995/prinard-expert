@@ -7,6 +7,7 @@ const path = require('path');
 const fs = require('fs');
 
 const app = express();
+const PORT = Number(process.env.PORT) || 8080;
 
 // Middleware
 app.use(cors());
@@ -40,20 +41,57 @@ const upload = multer({
 // Nodemailer Transporter
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
-  port: process.env.SMTP_PORT || 465,
-  secure: true,
+  port: Number(process.env.SMTP_PORT) || 465,
+  secure: (Number(process.env.SMTP_PORT) || 465) === 465,
   auth: {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS
   }
 });
 
+function normalizeAdminRecipients(value) {
+  if (!value) return [];
+
+  return value
+    .split(',')
+    .map((email) => email.trim())
+    .filter(Boolean);
+}
+
+const adminRecipients = normalizeAdminRecipients(process.env.ADMIN_EMAIL);
+
 const smtpConfigured = Boolean(
   process.env.SMTP_USER &&
   process.env.SMTP_PASS &&
   !process.env.SMTP_PASS.startsWith('YOUR_') &&
-  process.env.ADMIN_EMAIL
+  adminRecipients.length > 0
 );
+
+function getSmtpErrorMessage(error) {
+  const code = error && error.code ? String(error.code).toUpperCase() : '';
+  const response = error && error.response ? String(error.response) : '';
+
+  if (code.includes('EAUTH') || response.includes('535') || response.includes('Username and Password not accepted')) {
+    return 'SMTP authentication failed. Check your Gmail address and App Password in Render environment variables.';
+  }
+
+  if (code.includes('ECONNREFUSED') || response.includes('Connection refused')) {
+    return 'SMTP connection failed. Check the SMTP host and port settings.';
+  }
+
+  if (code.includes('ETIMEDOUT') || code.includes('ESOCKET')) {
+    return 'SMTP connection timed out. Check the SMTP host, port, and Render network settings.';
+  }
+
+  return 'The email service rejected the request. Please verify your SMTP settings.';
+}
+
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    ok: true,
+    emailConfigured: smtpConfigured
+  });
+});
 
 // API Endpoint for Form Submissions
 app.post('/api/submit-brief', upload.single('projectFile'), async (req, res) => {
@@ -65,16 +103,20 @@ app.post('/api/submit-brief', upload.single('projectFile'), async (req, res) => 
       return res.status(400).json({ success: false, message: 'Please complete all required fields.' });
     }
 
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ success: false, message: 'Please provide a valid email address.' });
+    }
+
     if (!smtpConfigured) {
       return res.status(503).json({
         success: false,
-        message: 'Email service is not configured. Add a valid Gmail app password to the SMTP_PASS setting in .env.'
+        message: 'Email service is not configured. Add a valid Gmail app password and at least one ADMIN_EMAIL in the environment.'
       });
     }
 
     const mailOptions = {
       from: `"PRINARD EXPERT Web Portal" <${process.env.SMTP_USER}>`,
-      to: process.env.ADMIN_EMAIL,
+      to: adminRecipients,
       replyTo: email,
       subject: `New Project Brief: ${fullName} [${service}]`,
       text: `NEW PROJECT SUBMISSION - PRINARD EXPERT\n\n` +
@@ -98,13 +140,26 @@ app.post('/api/submit-brief', upload.single('projectFile'), async (req, res) => 
     console.error('Server Submission Error:', error);
     res.status(500).json({
       success: false,
-      message: 'An error occurred while transmitting your request. Please try again.'
+      message: getSmtpErrorMessage(error)
     });
   }
 });
 
-// Start Server
-const PORT = Number(process.env.PORT) || 8080;
+app.use((error, req, res, next) => {
+  if (error instanceof multer.MulterError) {
+    const message = error.code === 'LIMIT_FILE_SIZE'
+      ? 'The attached file exceeds the 25MB limit.'
+      : 'The attached file could not be processed.';
+    return res.status(400).json({ success: false, message });
+  }
+
+  console.error('Unhandled Request Error:', error);
+  return res.status(500).json({
+    success: false,
+    message: 'The request could not be processed. Please try again.'
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`PRINARD EXPERT Application running live on http://localhost:${PORT}`);
 });
