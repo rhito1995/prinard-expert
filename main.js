@@ -1,52 +1,63 @@
-document.addEventListener('DOMContentLoaded', () => {
-    const quoteForm = document.getElementById('quoteForm');
-    const submitBtn = document.getElementById('submitBtn');
-    const alertBox = document.getElementById('formAlert');
-    const apiBaseUrl = window.location.port === '8000' ? 'http://localhost:8080' : '';
+// Mobile nav toggle
+const navToggle = document.getElementById('navToggle');
+const navLinks = document.querySelector('.nav-links');
 
-    quoteForm.addEventListener('submit', async (e) => {
-        e.preventDefault();
+if (navToggle && navLinks) {
+  navToggle.addEventListener('click', () => {
+    navLinks.classList.toggle('open');
+  });
 
-        // Disable button to prevent double-submission
-        submitBtn.disabled = true;
-        submitBtn.innerText = "Transmitting Brief...";
-        alertBox.classList.add('d-none');
+  // Close menu when a link is clicked (mobile)
+  navLinks.querySelectorAll('a').forEach((link) => {
+    link.addEventListener('click', () => navLinks.classList.remove('open'));
+  });
+}
 
-        const formData = new FormData(quoteForm);
+// Footer year
+const yearEl = document.getElementById('year');
+if (yearEl) {
+  yearEl.textContent = new Date().getFullYear();
+}
 
-        try {
-            const response = await fetch(`${apiBaseUrl}/api/submit-brief`, {
-                method: 'POST',
-                body: formData
-            });
+// Contact form submission
+const contactForm = document.getElementById('contactForm');
+const formStatus = document.getElementById('formStatus');
+const submitBtn = document.getElementById('submitBtn');
 
-            let result = { success: false, message: 'Submission failed.' };
+if (contactForm) {
+  contactForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
 
-            const contentType = response.headers.get('content-type') || '';
+    const formData = new FormData(contactForm);
 
-            if (contentType.includes('application/json')) {
-                result = await response.json();
-            } else {
-                const text = await response.text();
-                if (text) result.message = text;
-            }
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Sending...';
+    formStatus.textContent = '';
+    formStatus.className = 'form-status';
 
-            if (!response.ok || !result.success) {
-                throw new Error(result.message || `Request failed with status ${response.status}.`);
-            }
+    try {
+      const response = await fetch('/api/contact', {
+        method: 'POST',
+        body: formData,
+      });
 
-            alertBox.className = "alert alert-success mt-3";
-            alertBox.innerText = result.message;
-            alertBox.classList.remove('d-none');
-            quoteForm.reset();
+      const result = await response.json();
 
-        } catch (error) {
-            alertBox.className = "alert alert-danger mt-3";
-            alertBox.innerText = error.message || 'Error submitting request. Please try again.';
-            alertBox.classList.remove('d-none');
-        } finally {
-            submitBtn.disabled = false;
-            submitBtn.innerText = "Submit Brief for Evaluation";
-        }
-    });
-});
+      if (response.ok && result.success) {
+        formStatus.textContent = result.message || 'Message sent successfully!';
+        formStatus.classList.add('success');
+        contactForm.reset();
+      } else {
+        formStatus.textContent = result.message || 'Something went wrong. Please try again.';
+        formStatus.classList.add('error');
+      }
+    } catch (err) {
+      console.error('Contact form error:', err);
+      formStatus.textContent = 'Network error. Please check your connection and try again.';
+      formStatus.classList.add('error');
+    } finally {
+      submitBtn.disabled = false;
+      submitBtn.innerHTML = 'Submit Brief for Evaluation <span>→</span>';
+    }
+  });
+}

@@ -1,165 +1,200 @@
-require('dotenv').config();
-const express = require('express');
-const multer = require('multer');
-const nodemailer = require('nodemailer');
-const cors = require('cors');
-const path = require('path');
 const fs = require('fs');
+const path = require('path');
+const envPath = fs.existsSync(path.join(__dirname, '.env'))
+  ? path.join(__dirname, '.env')
+  : path.join(__dirname, '.evn');
+require('dotenv').config({ path: envPath });
+
+const express = require('express');
+const cors = require('cors');
+const nodemailer = require('nodemailer');
+const rateLimit = require('express-rate-limit');
+const multer = require('multer');
 
 const app = express();
-const PORT = Number(process.env.PORT) || 8080;
+const PORT = process.env.PORT || 3000;
+const allowedServices = new Set([
+  'Research Support',
+  'Data & Econometrics',
+  'Strategic Consultancy',
+]);
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use(express.static(__dirname));
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-
-// Ensure uploads folder exists
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
+function sanitizeText(value) {
+  return String(value ?? '')
+    .replace(/[<>]/g, '')
+    .trim();
 }
 
-// Multer File Upload Configuration
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, 'uploads/');
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, `${uniqueSuffix}-${file.originalname}`);
-  }
-});
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+// ------------------------------
+// Middleware
+// ------------------------------
+app.use(cors({
+  origin: process.env.CLIENT_URL || '*',
+}));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 const upload = multer({
-  storage: storage,
-  limits: { fileSize: 25 * 1024 * 1024 } // 25 MB File Limit
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
 });
 
-// Nodemailer Transporter
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || 'smtp.gmail.com',
-  port: Number(process.env.SMTP_PORT) || 465,
-  secure: (Number(process.env.SMTP_PORT) || 465) === 465,
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS
-  }
+// Serve the frontend from the project root
+app.use(express.static(__dirname));
+
+// Basic rate limiting on the contact endpoint to prevent abuse
+const contactLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,
+  message: { success: false, message: 'Too many requests. Please try again later.' },
 });
 
-function normalizeAdminRecipients(value) {
-  if (!value) return [];
+// ------------------------------
+// Mailer setup
+// ------------------------------
+function buildTransporter() {
+  const host = process.env.SMTP_HOST || process.env.EMAIL_HOST || 'smtp.gmail.com';
+  const port = Number(process.env.SMTP_PORT || process.env.EMAIL_PORT) || 465;
+  const user = process.env.SMTP_USER || process.env.EMAIL_USER;
+  const pass = process.env.SMTP_PASS || process.env.EMAIL_PASS;
 
-  return value
-    .split(',')
-    .map((email) => email.trim())
-    .filter(Boolean);
-}
-
-const adminRecipients = normalizeAdminRecipients(process.env.ADMIN_EMAIL);
-
-const smtpConfigured = Boolean(
-  process.env.SMTP_USER &&
-  process.env.SMTP_PASS &&
-  !process.env.SMTP_PASS.startsWith('YOUR_') &&
-  adminRecipients.length > 0
-);
-
-function getSmtpErrorMessage(error) {
-  const code = error && error.code ? String(error.code).toUpperCase() : '';
-  const response = error && error.response ? String(error.response) : '';
-
-  if (code.includes('EAUTH') || response.includes('535') || response.includes('Username and Password not accepted')) {
-    return 'SMTP authentication failed. Check your Gmail address and App Password in Render environment variables.';
+  if (!user || !pass) {
+    return null;
   }
 
-  if (code.includes('ECONNREFUSED') || response.includes('Connection refused')) {
-    return 'SMTP connection failed. Check the SMTP host and port settings.';
-  }
-
-  if (code.includes('ETIMEDOUT') || code.includes('ESOCKET')) {
-    return 'SMTP connection timed out. Check the SMTP host, port, and Render network settings.';
-  }
-
-  return 'The email service rejected the request. Please verify your SMTP settings.';
-}
-
-app.get('/health', (req, res) => {
-  res.status(200).json({
-    ok: true,
-    emailConfigured: smtpConfigured
+  return nodemailer.createTransport({
+    host,
+    port,
+    secure: port === 465,
+    auth: {
+      user,
+      pass,
+    },
   });
+}
+
+const transporter = buildTransporter();
+
+// ------------------------------
+// Routes
+// ------------------------------
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// API Endpoint for Form Submissions
-app.post('/api/submit-brief', upload.single('projectFile'), async (req, res) => {
+// Contact form submission
+app.post('/api/contact', contactLimiter, upload.single('file'), async (req, res) => {
   try {
-    const { fullName, email, phone, service, brief } = req.body;
-    const attachedFile = req.file;
+    const name = sanitizeText(req.body?.name);
+    const email = sanitizeText(req.body?.email).toLowerCase();
+    const phone = sanitizeText(req.body?.phone);
+    const service = sanitizeText(req.body?.service);
+    const message = sanitizeText(req.body?.message);
 
-    if (!fullName || !email || !service || !brief) {
-      return res.status(400).json({ success: false, message: 'Please complete all required fields.' });
-    }
-
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return res.status(400).json({ success: false, message: 'Please provide a valid email address.' });
-    }
-
-    if (!smtpConfigured) {
-      return res.status(503).json({
+    if (!name || !email || !service || !message) {
+      return res.status(400).json({
         success: false,
-        message: 'Email service is not configured. Add a valid Gmail app password and at least one ADMIN_EMAIL in the environment.'
+        message: 'Name, email, service, and message are required.',
       });
     }
 
-    const mailOptions = {
-      from: `"PRINARD EXPERT Web Portal" <${process.env.SMTP_USER}>`,
-      to: adminRecipients,
+    if (!allowedServices.has(service)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please select a valid service option.',
+      });
+    }
+
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailPattern.test(email)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide a valid email address.',
+      });
+    }
+
+    if (phone && !/^[-+()\d\s]{7,20}$/.test(phone)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide a valid phone number.',
+      });
+    }
+
+    if (!transporter) {
+      // No email credentials configured yet — log instead of failing hard
+      console.log('--- New contact submission (email not configured) ---');
+      console.log({
+        name,
+        email,
+        phone,
+        service,
+        message,
+        file: req.file?.originalname,
+        receivedAt: new Date().toISOString(),
+      });
+      return res.json({
+        success: true,
+        message: 'Message received (email delivery not yet configured on the server).',
+      });
+    }
+
+    const adminEmail = process.env.ADMIN_EMAIL || process.env.EMAIL_TO || process.env.SMTP_USER || process.env.EMAIL_USER;
+    const safeName = escapeHtml(name);
+    const safeEmail = escapeHtml(email);
+    const safeService = escapeHtml(service);
+    const safePhone = escapeHtml(phone || 'N/A');
+    const safeMessage = escapeHtml(message).replace(/\n/g, '<br>');
+
+    await transporter.sendMail({
+      from: `"${safeName}" <${process.env.SMTP_USER || process.env.EMAIL_USER}>`,
       replyTo: email,
-      subject: `New Project Brief: ${fullName} [${service}]`,
-      text: `NEW PROJECT SUBMISSION - PRINARD EXPERT\n\n` +
-            `Full Name: ${fullName}\n` +
-            `Email Address: ${email}\n` +
-            `Phone / WhatsApp: ${phone || 'Not provided'}\n` +
-            `Service Required: ${service}\n\n` +
-            `Project Requirements / Brief:\n${brief}\n\n` +
-            `Attached File: ${attachedFile ? attachedFile.originalname : 'No file attached'}`,
-      attachments: attachedFile ? [{ path: attachedFile.path, filename: attachedFile.originalname }] : []
-    };
-
-    await transporter.sendMail(mailOptions);
-
-    res.status(200).json({
-      success: true,
-      message: 'Your project brief has been submitted successfully. We will contact you shortly!'
+      to: adminEmail,
+      subject: `New contact form message from ${safeName}`,
+      text: `Name: ${name}\nEmail: ${email}\nPhone: ${phone || 'N/A'}\nService: ${service}\nAttachment: ${req.file?.originalname || 'None'}\n\nMessage:\n${message}`,
+      html: `
+        <h2>New Contact Form Submission</h2>
+        <p><strong>Name:</strong> ${safeName}</p>
+        <p><strong>Email:</strong> ${safeEmail}</p>
+        <p><strong>Phone:</strong> ${safePhone}</p>
+        <p><strong>Service:</strong> ${safeService}</p>
+        <p><strong>Attachment:</strong> ${escapeHtml(req.file?.originalname || 'None')}</p>
+        <p><strong>Message:</strong></p>
+        <p>${safeMessage}</p>
+      `,
+      attachments: req.file
+        ? [{ filename: req.file.originalname, content: req.file.buffer, contentType: req.file.mimetype }]
+        : [],
     });
 
-  } catch (error) {
-    console.error('Server Submission Error:', error);
+    res.json({ success: true, message: 'Thank you! Your message has been sent.' });
+  } catch (err) {
+    console.error('Error handling contact form submission:', err);
     res.status(500).json({
       success: false,
-      message: getSmtpErrorMessage(error)
+      message: 'Something went wrong while sending your message. Please try again later.',
     });
   }
 });
 
-app.use((error, req, res, next) => {
-  if (error instanceof multer.MulterError) {
-    const message = error.code === 'LIMIT_FILE_SIZE'
-      ? 'The attached file exceeds the 25MB limit.'
-      : 'The attached file could not be processed.';
-    return res.status(400).json({ success: false, message });
-  }
-
-  console.error('Unhandled Request Error:', error);
-  return res.status(500).json({
-    success: false,
-    message: 'The request could not be processed. Please try again.'
-  });
+// Fallback: serve index.html for any other GET route (simple SPA-style fallback)
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
 });
 
+// ------------------------------
+// Start server
+// ------------------------------
 app.listen(PORT, () => {
-  console.log(`PRINARD EXPERT Application running live on http://localhost:${PORT}`);
+  console.log(`Prinard Expert server running at http://localhost:${PORT}`);
 });
