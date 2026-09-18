@@ -1,9 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const envPath = fs.existsSync(path.join(__dirname, '.env'))
-  ? path.join(__dirname, '.env')
-  : path.join(__dirname, '.evn');
-require('dotenv').config({ path: envPath });
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const express = require('express');
 const cors = require('cors');
@@ -12,7 +9,7 @@ const rateLimit = require('express-rate-limit');
 const multer = require('multer');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const allowedServices = new Set([
   'Research Support',
   'Data & Econometrics',
@@ -83,6 +80,8 @@ function buildTransporter() {
 }
 
 const transporter = buildTransporter();
+const adminEmail = process.env.ADMIN_EMAIL || process.env.EMAIL_TO || process.env.SMTP_USER || process.env.EMAIL_USER;
+const emailConfigured = Boolean(transporter && adminEmail);
 
 // ------------------------------
 // Routes
@@ -90,7 +89,11 @@ const transporter = buildTransporter();
 
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.status(200).json({
+    status: 'ok',
+    emailConfigured,
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // Contact form submission
@@ -131,25 +134,13 @@ app.post('/api/contact', contactLimiter, upload.single('file'), async (req, res)
       });
     }
 
-    if (!transporter) {
-      // No email credentials configured yet — log instead of failing hard
-      console.log('--- New contact submission (email not configured) ---');
-      console.log({
-        name,
-        email,
-        phone,
-        service,
-        message,
-        file: req.file?.originalname,
-        receivedAt: new Date().toISOString(),
-      });
-      return res.json({
-        success: true,
-        message: 'Message received (email delivery not yet configured on the server).',
+    if (!emailConfigured) {
+      return res.status(503).json({
+        success: false,
+        message: 'Email service is not configured. Add SMTP_USER, SMTP_PASS, and ADMIN_EMAIL in Render.',
       });
     }
 
-    const adminEmail = process.env.ADMIN_EMAIL || process.env.EMAIL_TO || process.env.SMTP_USER || process.env.EMAIL_USER;
     const safeName = escapeHtml(name);
     const safeEmail = escapeHtml(email);
     const safeService = escapeHtml(service);
@@ -182,9 +173,37 @@ app.post('/api/contact', contactLimiter, upload.single('file'), async (req, res)
     console.error('Error handling contact form submission:', err);
     res.status(500).json({
       success: false,
-      message: 'Something went wrong while sending your message. Please try again later.',
+      message: getMailErrorMessage(err),
     });
   }
+});
+
+function getMailErrorMessage(error) {
+  const code = String(error?.code || '').toUpperCase();
+  const response = String(error?.response || '');
+
+  if (code.includes('EAUTH') || response.includes('535')) {
+    return 'SMTP authentication failed. Check the Gmail address and App Password in Render.';
+  }
+  if (code.includes('ETIMEDOUT') || code.includes('ECONNREFUSED') || code.includes('ESOCKET')) {
+    return 'SMTP connection failed. Check the SMTP host and port in Render.';
+  }
+  return 'Email delivery failed. Check the Render service logs and SMTP settings.';
+}
+
+app.use((error, req, res, next) => {
+  if (error instanceof multer.MulterError) {
+    const message = error.code === 'LIMIT_FILE_SIZE'
+      ? 'The attached file exceeds the 10MB limit.'
+      : 'The attached file could not be processed.';
+    return res.status(400).json({ success: false, message });
+  }
+
+  console.error('Unhandled request error:', error);
+  return res.status(500).json({
+    success: false,
+    message: 'The request could not be processed. Please try again.',
+  });
 });
 
 // Fallback: serve index.html for any other GET route (simple SPA-style fallback)
